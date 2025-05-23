@@ -130,13 +130,17 @@ with DAG(
         name="transform_bronze_to_silver",
         conn_id="spark_conn",
         verbose=True,
-        conf={
-            "spark.hadoop.fs.s3a.access.key": AWS_ACCESS_KEY,
-            "spark.hadoop.fs.s3a.secret.key": AWS_SECRET_KEY,
-            "spark.hadoop.fs.s3a.endpoint": "http://minio:9000",
-            "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
-            "spark.sql.warehouse.dir": "s3a://warehouse/",
-        },
+        jars=(
+            "/opt/airflow/dags/spark_jars/s3-2.31.36.jar,"
+            "/opt/airflow/dags/spark_jars/iceberg-spark-runtime-3.2_2.12-1.4.3.jar,"
+            "/opt/airflow/dags/spark_jars/iceberg-hive-runtime-1.4.3.jar"
+        ),
+        application_args=[
+            "--year",
+            "{{ logical_date.strftime('%Y') }}",
+            "--month",
+            "{{ logical_date.strftime('%m') }}",
+        ],
     )
 
     load_silver_to_gold = SparkSubmitOperator(
@@ -145,13 +149,17 @@ with DAG(
         name="load_silver_to_gold",
         conn_id="spark_conn",
         verbose=True,
-        conf={
-            "spark.hadoop.fs.s3a.access.key": AWS_ACCESS_KEY,
-            "spark.hadoop.fs.s3a.secret.key": AWS_SECRET_KEY,
-            "spark.hadoop.fs.s3a.endpoint": "http://minio:9000",
-            "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
-            "spark.sql.warehouse.dir": "s3a://warehouse/",
-        },
+        jars=(
+            "/opt/airflow/dags/spark_jars/s3-2.31.36.jar,"
+            "/opt/airflow/dags/spark_jars/iceberg-spark-runtime-3.2_2.12-1.4.3.jar,"
+            "/opt/airflow/dags/spark_jars/iceberg-hive-runtime-1.4.3.jar"
+        ),
+        application_args=[
+            "--year",
+            "{{ logical_date.strftime('%Y') }}",
+            "--month",
+            "{{ logical_date.strftime('%m') }}",
+        ],
     )
 
 

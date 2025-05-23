@@ -85,6 +85,8 @@ services:
         /opt/hive/bin/schematool -initSchema -dbType postgres --verbose &&
         hive --service metastore
       "
+    networks:
+      - data_lakehouse
 
   dremio:
     platform: linux/x86_64
@@ -96,6 +98,8 @@ services:
     volumes:
       - dremio-data:/opt/dremio/data
     container_name: dremio
+    networks:
+      - data_lakehouse
 
   airflow:
     build: ./docker/airflow
@@ -139,5 +143,8 @@ volumes:
   postgres-data:
   dremio-data:
   postgres-airflow:
-  
+
+networks:
+  data_lakehouse:
+    driver: bridge
 
