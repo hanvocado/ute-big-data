@@ -1,121 +1,177 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, row_number, lit, dayofmonth, month, year, quarter, dayofweek, date_format
-from pyspark.sql.window import Window
+import os
 
-# Tạo SparkSession với cấu hình Iceberg
-spark = SparkSession.builder \
-    .appName("silver_to_gold_iceberg") \
-    .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog") \
-    .config("spark.sql.catalog.local.type", "hadoop") \
-    .config("spark.sql.catalog.local.warehouse", "s3a://warehouse/gold/icebergTables") \
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+spark = (
+    SparkSession.builder
+    .appName("silver_to_gold_iceberg")
+    .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY)
+    .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_KEY)
+    .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type", "hadoop")
+    .config("spark.sql.catalog.lakehouse.warehouse", "s3a://warehouse/gold/icebergTables")
     .getOrCreate()
-
-# Đọc dữ liệu silver từ MinIO (parquet)
-df_customers = spark.read.format("iceberg").load("s3a://warehouse/silver/icebergTables/crm/crm_customers")
-df_erp_demo = spark.read.format("iceberg").load("s3a://warehouse/silver/icebergTables/erp/erp_customer_demographic")
-df_erp_location = spark.read.format("iceberg").load("s3a://warehouse/silver/icebergTables/erp/erp_customer_location")
-
-df_products = spark.read.format("iceberg").load("s3a://warehouse/silver/icebergTables/crm/crm_products")
-df_categories = spark.read.format("iceberg").load("s3a://warehouse/silver/icebergTables/erp/erp_categories")
-
-df_sales = spark.read.format("iceberg").load("s3a://warehouse/silver/icebergTables/crm/crm_sales_details")
-
-# ========================
-# Tạo bảng dim_customers
-# ========================
-
-df_dim_customers = df_customers.alias("ci") \
-    .join(df_erp_demo.alias("ca"), col("ci.customer_id") == col("ca.customer_id"), "left") \
-    .join(df_erp_location.alias("la"), col("ci.customer_id") == col("la.customer_id"), "left") \
-    .select(
-        col("ci.customer_id"),
-        col("ci.customer_crm_id"),
-        col("ci.firstname"),
-        col("ci.lastname"),
-        col("la.customer_country"),
-        col("ci.marital_status"),
-        when(col("ci.gender") != "n/a", col("ci.gender")).otherwise(
-            when(col("ca.gender").isNotNull(), col("ca.gender")).otherwise(lit("n/a"))
-        ).alias("gender"),
-        col("ca.birthday"),
-        col("ci.join_crm_date")
-    )
-
-window_cust = Window.orderBy("customer_id")
-df_dim_customers = df_dim_customers.withColumn("customer_key", row_number().over(window_cust))
-
-# Ghi Iceberg
-df_dim_customers.writeTo("local.dim_customers").createOrReplace()
-
-# ========================
-# Tạo bảng dim_products
-# ========================
-
-df_dim_products = df_products.alias("pro") \
-    .join(df_categories.alias("cate"), "category_id", "left") \
-    .select(
-        col("pro.product_id"),
-        col("pro.product_crm_id"),
-        col("pro.product_name"),
-        col("pro.category_id"),
-        col("cate.category_name"),
-        col("cate.subcategory_name"),
-        col("cate.maintenance_flag"),
-        col("pro.product_cost"),
-        col("pro.product_line"),
-        col("pro.start_date"),
-        col("pro.end_date")
-    )
-
-window_prod = Window.orderBy("product_id", "start_date", "end_date")
-df_dim_products = df_dim_products.withColumn("product_key", row_number().over(window_prod))
-
-# Ghi Iceberg
-df_dim_products.writeTo("local.dim_products").createOrReplace()
-
-# ========================
-# Tạo bảng dim_dates
-# ========================
-
-min_date = df_sales.selectExpr("min(order_date) as min_date").collect()[0]["min_date"]
-max_date = df_sales.selectExpr("max(due_date) as max_date").collect()[0]["max_date"]
-
-from pyspark.sql.functions import sequence, explode, to_date
-
-date_seq_df = spark.sql(f"SELECT sequence(to_date('{min_date}'), to_date(date_add('{max_date}', 365)), interval 1 day) as date_seq") \
-    .select(explode("date_seq").alias("date_id"))
-
-df_dim_dates = date_seq_df.select(
-    col("date_id"),
-    dayofmonth("date_id").alias("day"),
-    month("date_id").alias("month"),
-    year("date_id").alias("year"),
-    quarter("date_id").alias("quarter"),
-    dayofweek("date_id").alias("day_of_week"),
-    date_format("date_id", "EEEE").alias("day_name"),
-    date_format("date_id", "MMMM").alias("month_name"),
-    (dayofweek("date_id").isin([1,7])).cast("boolean").alias("is_weekend")
 )
 
-df_dim_dates.writeTo("local.dim_dates").createOrReplace()
+print("Spark is running")
 
-# ========================
+# Tạo database gold trong catalog lakehouse
+spark.sql("CREATE DATABASE IF NOT EXISTS gold")
+
+# Lấy min, max date để dùng cho dim_dates
+min_max = spark.sql("""
+SELECT 
+  MIN(order_date) AS min_date, 
+  MAX(due_date) AS max_date
+FROM iceberg.`s3a://warehouse/silver/icebergTables/crm/crm_sales_details`
+""").collect()[0]
+
+min_date = min_max.min_date.strftime('%Y-%m-%d')
+max_date = min_max.max_date.strftime('%Y-%m-%d')
+
+# Tạo bảng dim_customers
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_customers (
+    customer_id STRING,
+    customer_crm_id STRING,
+    firstname STRING,
+    lastname STRING,
+    customer_country STRING,
+    marital_status STRING,
+    gender STRING,
+    birthday DATE,
+    join_crm_date DATE,
+    customer_key INT
+)
+USING iceberg
+""")
+
+spark.sql("""
+INSERT OVERWRITE lakehouse.gold.dim_customers
+SELECT
+    ci.customer_id,
+    ci.customer_crm_id,
+    ci.firstname,
+    ci.lastname,
+    la.customer_country,
+    ci.marital_status,
+    CASE 
+      WHEN ci.gender != 'n/a' THEN ci.gender 
+      ELSE COALESCE(ca.gender, 'n/a')
+    END AS gender,
+    ca.birthday,
+    ci.join_crm_date,
+    ROW_NUMBER() OVER (ORDER BY ci.customer_id) AS customer_key
+FROM iceberg.`s3a://warehouse/silver/icebergTables/crm/crm_customers` ci
+LEFT JOIN iceberg.`s3a://warehouse/silver/icebergTables/erp/erp_customer_demographic` ca ON ci.customer_id = ca.customer_id
+LEFT JOIN iceberg.`s3a://warehouse/silver/icebergTables/erp/erp_customer_location` la ON ci.customer_id = la.customer_id
+""")
+
+# Tạo bảng dim_products
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_products (
+    product_id STRING,
+    product_crm_id STRING,
+    product_name STRING,
+    category_id STRING,
+    category_name STRING,
+    subcategory_name STRING,
+    maintenance_flag STRING,
+    product_cost DOUBLE,
+    product_line STRING,
+    start_date DATE,
+    end_date DATE,
+    product_key INT
+)
+USING iceberg
+""")
+
+spark.sql("""
+INSERT OVERWRITE lakehouse.gold.dim_products
+SELECT
+    pro.product_id,
+    pro.product_crm_id,
+    pro.product_name,
+    pro.category_id,
+    cate.category_name,
+    cate.subcategory_name,
+    cate.maintenance_flag,
+    pro.product_cost,
+    pro.product_line,
+    pro.start_date,
+    pro.end_date,
+    ROW_NUMBER() OVER (ORDER BY pro.product_id, pro.start_date, pro.end_date) AS product_key
+FROM iceberg.`s3a://warehouse/silver/icebergTables/crm/crm_products` pro
+LEFT JOIN iceberg.`s3a://warehouse/silver/icebergTables/erp/erp_categories` cate ON pro.category_id = cate.category_id
+""")
+
+# Tạo bảng dim_dates
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.gold.dim_dates (
+    date_id DATE,
+    day INT,
+    month INT,
+    year INT,
+    quarter INT,
+    day_of_week INT,
+    day_name STRING,
+    month_name STRING,
+    is_weekend BOOLEAN
+)
+USING iceberg
+""")
+
+spark.sql(f"""
+INSERT OVERWRITE lakehouse.gold.dim_dates
+SELECT
+    date_id,
+    DAY(date_id) AS day,
+    MONTH(date_id) AS month,
+    YEAR(date_id) AS year,
+    QUARTER(date_id) AS quarter,
+    DAYOFWEEK(date_id) AS day_of_week,
+    DATE_FORMAT(date_id, 'EEEE') AS day_name,
+    DATE_FORMAT(date_id, 'MMMM') AS month_name,
+    CASE WHEN DAYOFWEEK(date_id) IN (1, 7) THEN TRUE ELSE FALSE END AS is_weekend
+FROM (
+    SELECT EXPLODE(SEQUENCE(TO_DATE('{min_date}'), TO_DATE(DATE_ADD('{max_date}', 365)), INTERVAL 1 DAY)) AS date_id
+)
+""")
+
 # Tạo bảng fact_sales
-# ========================
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.gold.fact_sales (
+    order_id STRING,
+    product_key INT,
+    customer_key INT,
+    order_date DATE,
+    ship_date DATE,
+    due_date DATE,
+    price DOUBLE,
+    quantity INT,
+    total_amount DOUBLE
+)
+USING iceberg
+""")
 
-df_fact_sales = df_sales.alias("sd") \
-    .join(df_dim_products.alias("pro"), col("sd.product_id") == col("pro.product_id"), "left") \
-    .join(df_dim_customers.alias("cust"), col("sd.customer_crm_id") == col("cust.customer_crm_id"), "left") \
-    .select(
-        col("sd.order_id"),
-        col("pro.product_key"),
-        col("cust.customer_key"),
-        col("sd.order_date"),
-        col("sd.ship_date"),
-        col("sd.due_date"),
-        col("sd.price"),
-        col("sd.quantity"),
-        col("sd.total_amount")
-    )
+spark.sql("""
+INSERT OVERWRITE lakehouse.gold.fact_sales
+SELECT
+    sd.order_id,
+    pro.product_key,
+    cust.customer_key,
+    sd.order_date,
+    sd.ship_date,
+    sd.due_date,
+    sd.price,
+    sd.quantity,
+    sd.total_amount
+FROM iceberg.`s3a://warehouse/silver/icebergTables/crm/crm_sales_details` sd
+LEFT JOIN lakehouse.gold.dim_products pro ON sd.product_id = pro.product_id
+LEFT JOIN lakehouse.gold.dim_customers cust ON sd.customer_crm_id = cust.customer_crm_id
+""")
 
-df_fact_sales.writeTo("local.fact_sales").createOrReplace()
+# Kiểm tra dữ liệu fact_sales
+spark.sql("SELECT * FROM lakehouse.gold.fact_sales LIMIT 10").show()
